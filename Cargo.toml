@@ -8,7 +8,7 @@ resolver = "2"
 
 [package]
 name = "tauri-plugin-serialplugin"
-version = "3.0.1"
+version = "3.0.2"
 description = "Tauri plugin for serial port access (desktop and Android)."
 edition = "2021"
 authors = ["Tauri Programme within The Commons Conservancy"]
@@ -48,7 +48,7 @@ serde_json = "1.0.140"
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
-android-usb-serial = { path = "crates/android-usb-serial", version = "0.1.0" }
+android-usb-serial = { path = "crates/android-usb-serial", version = "0.1.1" }
 serialport = "4.9.0"
 log = { version = "0.4", features = ["std"] }
 

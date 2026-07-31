@@ -31,7 +31,7 @@ struct CdcNotificationReader {
 }
 
 impl CdcNotificationReader {
-    fn start(mut endpoint: Box<dyn BulkIn>, max_packet_size: u16) -> Self {
+    fn start(mut endpoint: Box<dyn BulkIn>, max_packet_size: u16, control_index: u8) -> Self {
         let state = Arc::new(AtomicU16::new(0));
         let error = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
@@ -45,15 +45,12 @@ impl CdcNotificationReader {
             while !thread_stop.load(Ordering::Relaxed) {
                 match endpoint.read(&mut buffer, NOTIFICATION_READ_TIMEOUT_MS) {
                     Ok(ReadOutcome::Data(data)) if !data.is_empty() => {
-                        match parse_serial_state_notification(&data) {
-                            Ok(Some(serial_state)) => {
-                                thread_state.store(serial_state, Ordering::Relaxed);
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                *thread_error.lock().unwrap() = Some(error);
-                                break;
-                            }
+                        // Skip junk / other CDC notifications; keep polling like
+                        // usb-serial-for-android. Only transport I/O errors stop the thread.
+                        if let Some(serial_state) =
+                            parse_serial_state_notification(&data, control_index)
+                        {
+                            thread_state.store(serial_state, Ordering::Relaxed);
                         }
                     }
                     Ok(ReadOutcome::TimedOut) | Ok(ReadOutcome::Data(_)) => {}
@@ -104,32 +101,25 @@ impl Drop for CdcNotificationReader {
     }
 }
 
-fn parse_serial_state_notification(data: &[u8]) -> std::result::Result<Option<u16>, String> {
-    if data.len() < 8 {
-        return Err(format!(
-            "invalid CDC notification, expected at least 8 bytes, got {}",
-            data.len()
-        ));
+/// Returns `Some(bitmap)` for a valid SERIAL_STATE frame, otherwise `None`.
+/// Malformed / unrelated interrupt payloads are ignored so the reader stays alive.
+fn parse_serial_state_notification(data: &[u8], control_index: u8) -> Option<u16> {
+    if data.len() < SERIAL_STATE_NOTIFICATION_SIZE {
+        return None;
     }
-    if data[0] != NOTIFICATION_REQUEST_TYPE {
-        return Err(format!(
-            "invalid CDC notification request type 0x{:02x}",
-            data[0]
-        ));
+    if data[0] != NOTIFICATION_REQUEST_TYPE || data[1] != SERIAL_STATE_NOTIFICATION {
+        return None;
     }
-    if data[1] != SERIAL_STATE_NOTIFICATION {
-        return Ok(None);
+    let index = u16::from_le_bytes([data[4], data[5]]);
+    if index != u16::from(control_index) {
+        return None;
     }
-
     let payload_size = usize::from(u16::from_le_bytes([data[6], data[7]]));
-    if payload_size != 2 || data.len() != 8 + payload_size {
-        return Err(format!(
-            "invalid CDC serial-state notification, expected {SERIAL_STATE_NOTIFICATION_SIZE} bytes, got {}",
-            data.len()
-        ));
+    // SERIAL_STATE carries 2 UART-state bytes; allow longer transfers (host padding).
+    if payload_size < 2 || data.len() < 8 + 2 {
+        return None;
     }
-
-    Ok(Some(u16::from_le_bytes([data[8], data[9]])))
+    Some(u16::from_le_bytes([data[8], data[9]]))
 }
 
 pub struct CdcAcmDriver {
@@ -266,6 +256,7 @@ impl Driver for CdcAcmDriver {
                 self.notification_reader = Some(CdcNotificationReader::start(
                     interrupt_in,
                     endpoint.max_packet_size,
+                    self.control_index,
                 ));
             }
 

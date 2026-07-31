@@ -203,23 +203,62 @@ fn serial_state_notifications_update_modem_status_and_release_endpoint() {
 }
 
 #[test]
-fn malformed_serial_state_notification_is_reported() {
+fn malformed_serial_state_notifications_are_skipped() {
     let fake = FakeTransport::cdc_iad();
+    // Truncated frame — ignored, reader keeps running.
     fake.push_interrupt_in(&[0xa1, 0x20, 0, 0, 0, 0, 2, 0, 1]);
 
     let mut port = open_on(&fake, 0);
+    std::thread::sleep(Duration::from_millis(30));
+    let status = port.modem_status().expect("modem stays ok after junk");
+    assert!(!status.cd && !status.dsr && !status.ri);
+
+    // Wrong bmRequestType — ignored.
+    fake.push_interrupt_in(&[0x00, 0x20, 0, 0, 0, 0, 2, 0, 0x0b, 0]);
+    std::thread::sleep(Duration::from_millis(30));
+    let status = port.modem_status().expect("modem stays ok after bad type");
+    assert!(!status.cd && !status.dsr && !status.ri);
+
+    // Wrong wIndex — ignored.
+    fake.push_interrupt_in(&[0xa1, 0x20, 0, 0, 1, 0, 2, 0, 0x0b, 0]);
+    std::thread::sleep(Duration::from_millis(30));
+    let status = port.modem_status().expect("modem stays ok after bad index");
+    assert!(!status.cd && !status.dsr && !status.ri);
+
+    // Valid SERIAL_STATE still applies after the junk.
+    fake.push_interrupt_in(&[0xa1, 0x20, 0, 0, 0, 0, 2, 0, 0x0b, 0]);
     let deadline = Instant::now() + Duration::from_secs(1);
-    let error = loop {
-        match port.modem_status() {
-            Ok(_) => {
-                assert!(
-                    Instant::now() < deadline,
-                    "malformed notification was not reported"
-                );
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(error) => break error,
+    loop {
+        let status = port.modem_status().expect("modem");
+        if status.cd && status.dsr && status.ri {
+            break;
         }
-    };
-    assert!(error.to_string().contains("expected 10 bytes, got 9"));
+        assert!(
+            Instant::now() < deadline,
+            "valid serial state after junk was not applied"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn padded_serial_state_notification_is_accepted() {
+    let fake = FakeTransport::cdc_iad();
+    let mut packet = vec![0xa1, 0x20, 0, 0, 0, 0, 2, 0, 0x03, 0];
+    packet.extend_from_slice(&[0; 54]); // host-padded to typical MPS
+    fake.push_interrupt_in(&packet);
+
+    let mut port = open_on(&fake, 0);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let status = port.modem_status().expect("modem");
+        if status.cd && status.dsr && !status.ri {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "padded serial state was not applied"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }

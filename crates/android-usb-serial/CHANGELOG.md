@@ -1,9 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.1.1
 
 - Track CDC ACM interrupt-IN notifications and expose DCD, DSR, and ring state
   through the modem-status API
+- Skip malformed / unrelated CDC interrupt frames instead of killing the
+  notification reader (match usb-serial-for-android)
 
 ## 0.1.0
 

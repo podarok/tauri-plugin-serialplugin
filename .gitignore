@@ -11,3 +11,4 @@ test-results
 *.apk
 *.aab
 local.properties
+.publish.md
