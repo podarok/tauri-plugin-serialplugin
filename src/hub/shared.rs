@@ -438,7 +438,7 @@ impl RxHubShared {
                     }
                     return Ok(slot.buffer);
                 }
-                return Err(format!("no data received within {} ms", timeout_ms));
+                return Self::recover_or_timeout(lock, cvar, timeout_ms);
             }
             let (g, timeout_result) = cvar
                 .wait_timeout(guard, remaining)
@@ -453,10 +453,34 @@ impl RxHubShared {
                     }
                     return Ok(slot.buffer);
                 }
-                return Err(format!("no data received within {} ms", timeout_ms));
+                return Self::recover_or_timeout(lock, cvar, timeout_ms);
             }
         }
         guard.take().unwrap()
+    }
+
+    /// Re-check `done` after losing the `read_slot` reclaim race on a
+    /// timeout path: dropping the `done` guard to avoid the ABBA deadlock
+    /// with `finish_read_slot()` opens a window where the hub thread can
+    /// claim the slot and post its result to `done` before we re-lock
+    /// `read_slot` and find it already empty. Wait briefly for that result
+    /// instead of discarding it as a spurious timeout.
+    fn recover_or_timeout(
+        lock: &Mutex<Option<Result<Vec<u8>, String>>>,
+        cvar: &Condvar,
+        timeout_ms: u64,
+    ) -> Result<Vec<u8>, String> {
+        let mut guard = crate::sync_util::lock_or_recover(lock);
+        if guard.is_none() {
+            let (g, _) = cvar
+                .wait_timeout(guard, Duration::from_millis(50))
+                .unwrap_or_else(|e| e.into_inner());
+            guard = g;
+        }
+        match guard.take() {
+            Some(result) => result,
+            None => Err(format!("no data received within {} ms", timeout_ms)),
+        }
     }
 
     pub fn pending_watch_bytes(&self, state: &HubRoutingState) -> usize {
