@@ -427,6 +427,11 @@ impl RxHubShared {
         while guard.is_none() {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                // Deadlock fix: drop the `done` mutex guard before locking
+                // `read_slot` — finish_read_slot() locks the same two mutexes
+                // in the opposite order (read_slot then done), so holding both
+                // here at once is an ABBA lock inversion.
+                drop(guard);
                 if let Some(slot) = crate::sync_util::lock_or_recover(&self.read_slot).take() {
                     if slot.buffer.is_empty() {
                         return Err(format!("no data received within {} ms", timeout_ms));
@@ -440,6 +445,8 @@ impl RxHubShared {
                 .map_err(|e| e.to_string())?;
             guard = g;
             if guard.is_none() && timeout_result.timed_out() && Instant::now() >= deadline {
+                // Same ABBA fix as above.
+                drop(guard);
                 if let Some(slot) = crate::sync_util::lock_or_recover(&self.read_slot).take() {
                     if slot.buffer.is_empty() {
                         return Err(format!("no data received within {} ms", timeout_ms));
@@ -523,6 +530,10 @@ impl RxHubShared {
         while guard.is_none() {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                // Same ABBA deadlock fix as read_request(): drop `done` before
+                // locking `drain` — finish_drain() takes them in the opposite
+                // order.
+                drop(guard);
                 *crate::sync_util::lock_or_recover(&self.drain) = None;
                 return Err("drain timed out waiting for hub".into());
             }
@@ -637,7 +648,13 @@ pub(crate) fn tick_read_slot(shared: &RxHubShared) {
 }
 
 pub(crate) fn finish_read_slot(shared: &RxHubShared, result: Result<Vec<u8>, String>) {
-    if let Some(slot) = crate::sync_util::lock_or_recover(&shared.read_slot).take() {
+    // Deadlock fix: bind the taken slot in a `let` (not an `if let` scrutinee)
+    // so the `read_slot` MutexGuard is dropped here, before locking `slot.done`
+    // below — Rust's temporary-lifetime extension for `if let` scrutinees would
+    // otherwise keep it held for the whole match arm, taking `read_slot` then
+    // `done` while read_request() can take them in the opposite order.
+    let slot = crate::sync_util::lock_or_recover(&shared.read_slot).take();
+    if let Some(slot) = slot {
         let (lock, cvar) = &*slot.done;
         *crate::sync_util::lock_or_recover(lock) = Some(result);
         cvar.notify_all();
@@ -654,7 +671,10 @@ pub(crate) fn push_idle(shared: &RxHubShared, chunk: &[u8]) {
 }
 
 pub(crate) fn finish_drain(shared: &RxHubShared, result: Result<Vec<u8>, String>) {
-    if let Some(drain) = crate::sync_util::lock_or_recover(&shared.drain).take() {
+    // Same fix as finish_read_slot(): `let` first so the `drain` guard drops
+    // before locking `drain.done`.
+    let drain = crate::sync_util::lock_or_recover(&shared.drain).take();
+    if let Some(drain) = drain {
         let (lock, cvar) = &*drain.done;
         *crate::sync_util::lock_or_recover(lock) = Some(result);
         cvar.notify_all();
