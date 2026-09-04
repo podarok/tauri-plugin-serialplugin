@@ -482,8 +482,22 @@ impl RxHubShared {
         cvar: &Condvar,
         timeout_ms: u64,
     ) -> Result<Vec<u8>, String> {
+        Self::recover_or_timeout_within(lock, cvar, timeout_ms, READ_SLOT_RACE_RECOVERY_WINDOW)
+    }
+
+    // `window` is a parameter (not always `READ_SLOT_RACE_RECOVERY_WINDOW`)
+    // so tests can use a much wider margin than production's 50ms — a slow
+    // CI runner preempting a spawned thread past a tight window would
+    // otherwise make timing-based tests flaky independent of whether the
+    // production code is correct.
+    fn recover_or_timeout_within(
+        lock: &Mutex<Option<Result<Vec<u8>, String>>>,
+        cvar: &Condvar,
+        timeout_ms: u64,
+        window: Duration,
+    ) -> Result<Vec<u8>, String> {
         let mut guard = crate::sync_util::lock_or_recover(lock);
-        let deadline = Instant::now() + READ_SLOT_RACE_RECOVERY_WINDOW;
+        let deadline = Instant::now() + window;
         // Loop, not a single wait: `Condvar::wait_timeout` can return on a
         // spurious wakeup with `guard` still `None` (no OS/libc condvar
         // guarantees against this) — a single wait would then treat that
@@ -952,11 +966,13 @@ mod tests {
         assert!(crate::sync_util::lock_or_recover(&shared.idle).is_empty());
     }
 
-    // Regression coverage for RxHubShared::recover_or_timeout() — added
-    // after cubic-dev-ai's review on PR #38 flagged the function as
-    // untested. Exercises it directly (it's a private assoc fn, visible to
-    // this nested test module via `use super::*`), independent of the
-    // full ABBA-race timing in read_request() itself.
+    // Regression coverage for RxHubShared::recover_or_timeout(). Exercises
+    // it directly (it's a private assoc fn, visible to this nested test
+    // module via `use super::*`), independent of the full ABBA-race timing
+    // in read_request() itself. Uses recover_or_timeout_within() with a
+    // wide window (well beyond each test's own posting delay) rather than
+    // the production 50ms constant, so a slow/preempted CI runner can't
+    // turn a correct implementation into a flaky test.
 
     #[test]
     fn recover_or_timeout_returns_result_posted_during_recovery_window() {
@@ -970,7 +986,7 @@ mod tests {
             cvar.notify_all();
         });
         let (lock, cvar) = &*done;
-        let result = RxHubShared::recover_or_timeout(lock, cvar, 5);
+        let result = RxHubShared::recover_or_timeout_within(lock, cvar, 5, Duration::from_secs(2));
         assert_eq!(result.expect("recovered result"), b"late");
     }
 
@@ -995,7 +1011,7 @@ mod tests {
             cvar.notify_all();
         });
         let (lock, cvar) = &*done;
-        let result = RxHubShared::recover_or_timeout(lock, cvar, 5);
+        let result = RxHubShared::recover_or_timeout_within(lock, cvar, 5, Duration::from_secs(2));
         assert_eq!(result.expect("recovered result"), b"after-spurious");
     }
 
