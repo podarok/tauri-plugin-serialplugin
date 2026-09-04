@@ -12,6 +12,18 @@ use tauri::ipc::Channel;
 
 pub(crate) const IDLE_BUFFER_CAP: usize = 64 * 1024;
 
+/// Bounded grace window `recover_or_timeout()` waits for a `done` result
+/// after losing the `read_slot` reclaim race. Deliberately independent of
+/// the read's own `timeout_ms`/deadline — by the time this runs, that
+/// deadline has already elapsed, so there is no "remaining" budget left to
+/// derive a value from. This is a second, much shorter window covering
+/// only the race itself: the hub thread has already taken the slot and is
+/// in the middle of posting its result, which takes microseconds under
+/// normal scheduling (no I/O in that path). Not a full elimination of the
+/// race under pathological scheduler starvation, but any finite bound has
+/// that same limit.
+const READ_SLOT_RACE_RECOVERY_WINDOW: Duration = Duration::from_millis(50);
+
 type ExchangeDone = Arc<(
     Mutex<Option<Result<(Vec<u8>, ExchangeMatch), String>>>,
     Condvar,
@@ -471,9 +483,20 @@ impl RxHubShared {
         timeout_ms: u64,
     ) -> Result<Vec<u8>, String> {
         let mut guard = crate::sync_util::lock_or_recover(lock);
-        if guard.is_none() {
+        let deadline = Instant::now() + READ_SLOT_RACE_RECOVERY_WINDOW;
+        // Loop, not a single wait: `Condvar::wait_timeout` can return on a
+        // spurious wakeup with `guard` still `None` (no OS/libc condvar
+        // guarantees against this) — a single wait would then treat that
+        // spurious wakeup as "recovery window over, no result", discarding
+        // a real result that shows up a moment later, the same class of
+        // bug this function exists to fix.
+        while guard.is_none() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
             let (g, _) = cvar
-                .wait_timeout(guard, Duration::from_millis(50))
+                .wait_timeout(guard, remaining)
                 .unwrap_or_else(|e| e.into_inner());
             guard = g;
         }
@@ -927,5 +950,64 @@ mod tests {
         let channel = Channel::<SerialEvent>::new(|_| Ok(()));
         shared.attach_watch(channel, 100, 1024);
         assert!(crate::sync_util::lock_or_recover(&shared.idle).is_empty());
+    }
+
+    // Regression coverage for RxHubShared::recover_or_timeout() — added
+    // after cubic-dev-ai's review on PR #38 flagged the function as
+    // untested. Exercises it directly (it's a private assoc fn, visible to
+    // this nested test module via `use super::*`), independent of the
+    // full ABBA-race timing in read_request() itself.
+
+    #[test]
+    fn recover_or_timeout_returns_result_posted_during_recovery_window() {
+        let done: Arc<(Mutex<Option<Result<Vec<u8>, String>>>, Condvar)> =
+            Arc::new((Mutex::new(None), Condvar::new()));
+        let done_bg = done.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            let (lock, cvar) = &*done_bg;
+            *crate::sync_util::lock_or_recover(lock) = Some(Ok(b"late".to_vec()));
+            cvar.notify_all();
+        });
+        let (lock, cvar) = &*done;
+        let result = RxHubShared::recover_or_timeout(lock, cvar, 5);
+        assert_eq!(result.expect("recovered result"), b"late");
+    }
+
+    #[test]
+    fn recover_or_timeout_survives_spurious_wakeups() {
+        // Fires several notify_all()s with `done` still None before the
+        // real result lands — simulates the condvar spurious-wakeup case
+        // review finding #3 flagged. A single-`wait_timeout` version (the
+        // pre-fix code) returns a false timeout on the very first one;
+        // the fixed loop keeps waiting out the recovery window instead.
+        let done: Arc<(Mutex<Option<Result<Vec<u8>, String>>>, Condvar)> =
+            Arc::new((Mutex::new(None), Condvar::new()));
+        let done_bg = done.clone();
+        thread::spawn(move || {
+            for _ in 0..3 {
+                thread::sleep(Duration::from_millis(5));
+                done_bg.1.notify_all();
+            }
+            thread::sleep(Duration::from_millis(5));
+            let (lock, cvar) = &*done_bg;
+            *crate::sync_util::lock_or_recover(lock) = Some(Ok(b"after-spurious".to_vec()));
+            cvar.notify_all();
+        });
+        let (lock, cvar) = &*done;
+        let result = RxHubShared::recover_or_timeout(lock, cvar, 5);
+        assert_eq!(result.expect("recovered result"), b"after-spurious");
+    }
+
+    #[test]
+    fn recover_or_timeout_falls_back_to_timeout_error_when_nothing_arrives() {
+        let done: (Mutex<Option<Result<Vec<u8>, String>>>, Condvar) =
+            (Mutex::new(None), Condvar::new());
+        let start = Instant::now();
+        let result = RxHubShared::recover_or_timeout(&done.0, &done.1, 5);
+        let err = result.expect_err("no result ever posted");
+        assert!(err.contains("no data received"), "unexpected: {err}");
+        // Bounded by READ_SLOT_RACE_RECOVERY_WINDOW (50ms), not a hang.
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 }
