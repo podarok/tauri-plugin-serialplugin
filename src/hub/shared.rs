@@ -12,6 +12,18 @@ use tauri::ipc::Channel;
 
 pub(crate) const IDLE_BUFFER_CAP: usize = 64 * 1024;
 
+/// Bounded grace window `recover_or_timeout()` waits for a `done` result
+/// after losing the `read_slot` reclaim race. Deliberately independent of
+/// the read's own `timeout_ms`/deadline — by the time this runs, that
+/// deadline has already elapsed, so there is no "remaining" budget left to
+/// derive a value from. This is a second, much shorter window covering
+/// only the race itself: the hub thread has already taken the slot and is
+/// in the middle of posting its result, which takes microseconds under
+/// normal scheduling (no I/O in that path). Not a full elimination of the
+/// race under pathological scheduler starvation, but any finite bound has
+/// that same limit.
+const READ_SLOT_RACE_RECOVERY_WINDOW: Duration = Duration::from_millis(50);
+
 type ExchangeDone = Arc<(
     Mutex<Option<Result<(Vec<u8>, ExchangeMatch), String>>>,
     Condvar,
@@ -427,29 +439,85 @@ impl RxHubShared {
         while guard.is_none() {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                // Deadlock fix: drop the `done` mutex guard before locking
+                // `read_slot` — finish_read_slot() locks the same two mutexes
+                // in the opposite order (read_slot then done), so holding both
+                // here at once is an ABBA lock inversion.
+                drop(guard);
                 if let Some(slot) = crate::sync_util::lock_or_recover(&self.read_slot).take() {
                     if slot.buffer.is_empty() {
                         return Err(format!("no data received within {} ms", timeout_ms));
                     }
                     return Ok(slot.buffer);
                 }
-                return Err(format!("no data received within {} ms", timeout_ms));
+                return Self::recover_or_timeout(lock, cvar, timeout_ms);
             }
             let (g, timeout_result) = cvar
                 .wait_timeout(guard, remaining)
                 .map_err(|e| e.to_string())?;
             guard = g;
             if guard.is_none() && timeout_result.timed_out() && Instant::now() >= deadline {
+                // Same ABBA fix as above.
+                drop(guard);
                 if let Some(slot) = crate::sync_util::lock_or_recover(&self.read_slot).take() {
                     if slot.buffer.is_empty() {
                         return Err(format!("no data received within {} ms", timeout_ms));
                     }
                     return Ok(slot.buffer);
                 }
-                return Err(format!("no data received within {} ms", timeout_ms));
+                return Self::recover_or_timeout(lock, cvar, timeout_ms);
             }
         }
         guard.take().unwrap()
+    }
+
+    /// Re-check `done` after losing the `read_slot` reclaim race on a
+    /// timeout path: dropping the `done` guard to avoid the ABBA deadlock
+    /// with `finish_read_slot()` opens a window where the hub thread can
+    /// claim the slot and post its result to `done` before we re-lock
+    /// `read_slot` and find it already empty. Wait briefly for that result
+    /// instead of discarding it as a spurious timeout.
+    fn recover_or_timeout(
+        lock: &Mutex<Option<Result<Vec<u8>, String>>>,
+        cvar: &Condvar,
+        timeout_ms: u64,
+    ) -> Result<Vec<u8>, String> {
+        Self::recover_or_timeout_within(lock, cvar, timeout_ms, READ_SLOT_RACE_RECOVERY_WINDOW)
+    }
+
+    // `window` is a parameter (not always `READ_SLOT_RACE_RECOVERY_WINDOW`)
+    // so tests can use a much wider margin than production's 50ms — a slow
+    // CI runner preempting a spawned thread past a tight window would
+    // otherwise make timing-based tests flaky independent of whether the
+    // production code is correct.
+    fn recover_or_timeout_within(
+        lock: &Mutex<Option<Result<Vec<u8>, String>>>,
+        cvar: &Condvar,
+        timeout_ms: u64,
+        window: Duration,
+    ) -> Result<Vec<u8>, String> {
+        let mut guard = crate::sync_util::lock_or_recover(lock);
+        let deadline = Instant::now() + window;
+        // Loop, not a single wait: `Condvar::wait_timeout` can return on a
+        // spurious wakeup with `guard` still `None` (no OS/libc condvar
+        // guarantees against this) — a single wait would then treat that
+        // spurious wakeup as "recovery window over, no result", discarding
+        // a real result that shows up a moment later, the same class of
+        // bug this function exists to fix.
+        while guard.is_none() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let (g, _) = cvar
+                .wait_timeout(guard, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            guard = g;
+        }
+        match guard.take() {
+            Some(result) => result,
+            None => Err(format!("no data received within {} ms", timeout_ms)),
+        }
     }
 
     pub fn pending_watch_bytes(&self, state: &HubRoutingState) -> usize {
@@ -523,6 +591,10 @@ impl RxHubShared {
         while guard.is_none() {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                // Same ABBA deadlock fix as read_request(): drop `done` before
+                // locking `drain` — finish_drain() takes them in the opposite
+                // order.
+                drop(guard);
                 *crate::sync_util::lock_or_recover(&self.drain) = None;
                 return Err("drain timed out waiting for hub".into());
             }
@@ -637,7 +709,13 @@ pub(crate) fn tick_read_slot(shared: &RxHubShared) {
 }
 
 pub(crate) fn finish_read_slot(shared: &RxHubShared, result: Result<Vec<u8>, String>) {
-    if let Some(slot) = crate::sync_util::lock_or_recover(&shared.read_slot).take() {
+    // Deadlock fix: bind the taken slot in a `let` (not an `if let` scrutinee)
+    // so the `read_slot` MutexGuard is dropped here, before locking `slot.done`
+    // below — Rust's temporary-lifetime extension for `if let` scrutinees would
+    // otherwise keep it held for the whole match arm, taking `read_slot` then
+    // `done` while read_request() can take them in the opposite order.
+    let slot = crate::sync_util::lock_or_recover(&shared.read_slot).take();
+    if let Some(slot) = slot {
         let (lock, cvar) = &*slot.done;
         *crate::sync_util::lock_or_recover(lock) = Some(result);
         cvar.notify_all();
@@ -654,7 +732,10 @@ pub(crate) fn push_idle(shared: &RxHubShared, chunk: &[u8]) {
 }
 
 pub(crate) fn finish_drain(shared: &RxHubShared, result: Result<Vec<u8>, String>) {
-    if let Some(drain) = crate::sync_util::lock_or_recover(&shared.drain).take() {
+    // Same fix as finish_read_slot(): `let` first so the `drain` guard drops
+    // before locking `drain.done`.
+    let drain = crate::sync_util::lock_or_recover(&shared.drain).take();
+    if let Some(drain) = drain {
         let (lock, cvar) = &*drain.done;
         *crate::sync_util::lock_or_recover(lock) = Some(result);
         cvar.notify_all();
@@ -883,5 +964,66 @@ mod tests {
         let channel = Channel::<SerialEvent>::new(|_| Ok(()));
         shared.attach_watch(channel, 100, 1024);
         assert!(crate::sync_util::lock_or_recover(&shared.idle).is_empty());
+    }
+
+    // Regression coverage for RxHubShared::recover_or_timeout(). Exercises
+    // it directly (it's a private assoc fn, visible to this nested test
+    // module via `use super::*`), independent of the full ABBA-race timing
+    // in read_request() itself. Uses recover_or_timeout_within() with a
+    // wide window (well beyond each test's own posting delay) rather than
+    // the production 50ms constant, so a slow/preempted CI runner can't
+    // turn a correct implementation into a flaky test.
+
+    #[test]
+    fn recover_or_timeout_returns_result_posted_during_recovery_window() {
+        let done: Arc<(Mutex<Option<Result<Vec<u8>, String>>>, Condvar)> =
+            Arc::new((Mutex::new(None), Condvar::new()));
+        let done_bg = done.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            let (lock, cvar) = &*done_bg;
+            *crate::sync_util::lock_or_recover(lock) = Some(Ok(b"late".to_vec()));
+            cvar.notify_all();
+        });
+        let (lock, cvar) = &*done;
+        let result = RxHubShared::recover_or_timeout_within(lock, cvar, 5, Duration::from_secs(2));
+        assert_eq!(result.expect("recovered result"), b"late");
+    }
+
+    #[test]
+    fn recover_or_timeout_survives_spurious_wakeups() {
+        // Fires several notify_all()s with `done` still None before the
+        // real result lands — simulates the condvar spurious-wakeup case
+        // review finding #3 flagged. A single-`wait_timeout` version (the
+        // pre-fix code) returns a false timeout on the very first one;
+        // the fixed loop keeps waiting out the recovery window instead.
+        let done: Arc<(Mutex<Option<Result<Vec<u8>, String>>>, Condvar)> =
+            Arc::new((Mutex::new(None), Condvar::new()));
+        let done_bg = done.clone();
+        thread::spawn(move || {
+            for _ in 0..3 {
+                thread::sleep(Duration::from_millis(5));
+                done_bg.1.notify_all();
+            }
+            thread::sleep(Duration::from_millis(5));
+            let (lock, cvar) = &*done_bg;
+            *crate::sync_util::lock_or_recover(lock) = Some(Ok(b"after-spurious".to_vec()));
+            cvar.notify_all();
+        });
+        let (lock, cvar) = &*done;
+        let result = RxHubShared::recover_or_timeout_within(lock, cvar, 5, Duration::from_secs(2));
+        assert_eq!(result.expect("recovered result"), b"after-spurious");
+    }
+
+    #[test]
+    fn recover_or_timeout_falls_back_to_timeout_error_when_nothing_arrives() {
+        let done: (Mutex<Option<Result<Vec<u8>, String>>>, Condvar) =
+            (Mutex::new(None), Condvar::new());
+        let start = Instant::now();
+        let result = RxHubShared::recover_or_timeout(&done.0, &done.1, 5);
+        let err = result.expect_err("no result ever posted");
+        assert!(err.contains("no data received"), "unexpected: {err}");
+        // Bounded by READ_SLOT_RACE_RECOVERY_WINDOW (50ms), not a hang.
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 }
