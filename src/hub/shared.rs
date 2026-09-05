@@ -287,8 +287,9 @@ impl RxHubShared {
             session.feed_physical_rx(chunk);
             return;
         }
-        if crate::sync_util::lock_or_recover(&self.drain).is_some() {
-            route_drain_chunk(self, &path, chunk);
+        // Try drain without a separate is_some() check — that races with reclaim
+        // and route_drain_chunk used to drop bytes when the slot disappeared.
+        if route_drain_chunk(self, &path, chunk) {
             return;
         }
         if let Some(waiter) = crate::sync_util::lock_or_recover(&self.exchange_waiter).clone() {
@@ -309,31 +310,44 @@ impl RxHubShared {
     /// Idle timers for push model: drain completion + watch batch flush + read deadlines.
     pub fn tick(&self, path: &str, state: &mut HubRoutingState) {
         tick_read_slot(self);
-        if crate::sync_util::lock_or_recover(&self.drain).is_some() {
-            let early = {
-                let mut guard = crate::sync_util::lock_or_recover(&self.drain);
-                let Some(drain) = guard.as_mut() else {
-                    return;
-                };
-                if drain.cancel.load(Ordering::SeqCst) {
-                    Some(Err("exchange cancelled".into()))
-                } else if Instant::now() >= drain.deadline {
-                    Some(Ok(std::mem::take(&mut drain.buffer)))
-                } else if let Some(last) = drain.last_byte_at {
-                    if last.elapsed() >= Duration::from_millis(drain.idle_ms) {
-                        Some(Ok(std::mem::take(&mut drain.buffer)))
-                    } else {
-                        None
-                    }
-                } else if drain.started_at.elapsed() >= Duration::from_millis(drain.idle_ms) {
-                    Some(Ok(Vec::new()))
-                } else {
-                    None
-                }
-            };
-            if let Some(result) = early {
-                finish_drain(self, result);
+        let completed = {
+            let mut guard = crate::sync_util::lock_or_recover(&self.drain);
+            #[derive(Clone, Copy)]
+            enum Kind {
+                Cancel,
+                Buffer,
+                Empty,
             }
+            let kind = match guard.as_ref() {
+                None => None,
+                Some(d) if d.cancel.load(Ordering::SeqCst) => Some(Kind::Cancel),
+                Some(d) if Instant::now() >= d.deadline => Some(Kind::Buffer),
+                Some(d)
+                    if d.last_byte_at
+                        .is_some_and(|t| t.elapsed() >= Duration::from_millis(d.idle_ms)) =>
+                {
+                    Some(Kind::Buffer)
+                }
+                Some(d)
+                    if d.last_byte_at.is_none()
+                        && d.started_at.elapsed() >= Duration::from_millis(d.idle_ms) =>
+                {
+                    Some(Kind::Empty)
+                }
+                _ => None,
+            };
+            kind.map(|k| {
+                let d = guard.take().unwrap();
+                let result = match k {
+                    Kind::Cancel => Err("exchange cancelled".into()),
+                    Kind::Buffer => Ok(d.buffer),
+                    Kind::Empty => Ok(Vec::new()),
+                };
+                (d.done, result)
+            })
+        };
+        if let Some((done, result)) = completed {
+            wake_done(&done, result);
         }
 
         let batch_timeout_ms = self
@@ -595,8 +609,20 @@ impl RxHubShared {
                 // locking `drain` — finish_drain() takes them in the opposite
                 // order.
                 drop(guard);
-                *crate::sync_util::lock_or_recover(&self.drain) = None;
-                return Err("drain timed out waiting for hub".into());
+                // Same reclaim as read_request: take leftover slot, else recover posted done.
+                if let Some(slot) = crate::sync_util::lock_or_recover(&self.drain).take() {
+                    if slot.buffer.is_empty() {
+                        return Err("drain timed out waiting for hub".into());
+                    }
+                    return Ok(slot.buffer);
+                }
+                return match Self::recover_or_timeout(lock, cvar, 0) {
+                    Ok(buf) => Ok(buf),
+                    Err(e) if e.contains("no data received") => {
+                        Err("drain timed out waiting for hub".into())
+                    }
+                    Err(e) => Err(e),
+                };
             }
             let (g, _) = cvar
                 .wait_timeout(guard, remaining)
@@ -606,17 +632,20 @@ impl RxHubShared {
         guard.take().unwrap()
     }
 }
-pub(crate) fn route_drain_chunk(shared: &RxHubShared, path: &str, chunk: &[u8]) {
+/// Append RX into the active drain slot. Returns `false` if there is no slot
+/// (caller must route elsewhere — never silently drop the chunk).
+pub(crate) fn route_drain_chunk(shared: &RxHubShared, path: &str, chunk: &[u8]) -> bool {
     let prefixes = {
         let mut guard = crate::sync_util::lock_or_recover(&shared.drain);
         let Some(drain) = guard.as_mut() else {
-            return;
+            return false;
         };
         drain.buffer.extend_from_slice(chunk);
         drain.last_byte_at = Some(Instant::now());
         drain.solicited_prefixes.clone()
     };
     emit_drain_urc_with_prefixes(shared, path, chunk, &prefixes);
+    true
 }
 
 pub(crate) fn route_exchange_chunk(
@@ -661,64 +690,65 @@ pub(crate) fn route_watch_chunk(path: &str, chunk: &[u8], state: &mut HubRouting
 }
 
 pub(crate) fn route_read_slot_chunk(shared: &RxHubShared, chunk: &[u8]) {
-    let finish = {
+    let completed = {
         let mut guard = crate::sync_util::lock_or_recover(&shared.read_slot);
-        let Some(slot) = guard.as_mut() else {
-            return;
-        };
-        let remaining = slot.max_bytes.saturating_sub(slot.buffer.len());
-        if remaining == 0 {
-            Some(Ok(std::mem::take(&mut slot.buffer)))
-        } else {
-            let take = chunk.len().min(remaining);
-            slot.buffer.extend_from_slice(&chunk[..take]);
-            if !slot.fill || slot.buffer.len() >= slot.max_bytes {
-                Some(Ok(std::mem::take(&mut slot.buffer)))
-            } else {
-                None
+        let ready = {
+            let Some(slot) = guard.as_mut() else {
+                return;
+            };
+            let remaining = slot.max_bytes.saturating_sub(slot.buffer.len());
+            if remaining > 0 {
+                let n = chunk.len().min(remaining);
+                slot.buffer.extend_from_slice(&chunk[..n]);
             }
+            remaining == 0 || !slot.fill || slot.buffer.len() >= slot.max_bytes
+        };
+        if !ready {
+            None
+        } else {
+            let slot = guard.take().unwrap();
+            Some((slot.done, Ok(slot.buffer)))
         }
     };
-    if let Some(result) = finish {
-        finish_read_slot(shared, result);
+    if let Some((done, result)) = completed {
+        wake_done(&done, result);
     }
 }
 
 pub(crate) fn tick_read_slot(shared: &RxHubShared) {
-    let early = {
+    let completed = {
         let mut guard = crate::sync_util::lock_or_recover(&shared.read_slot);
-        let Some(slot) = guard.as_mut() else {
-            return;
+        let expired = match guard.as_ref() {
+            Some(slot) => Instant::now() >= slot.deadline,
+            None => return,
         };
-        if Instant::now() >= slot.deadline {
-            if slot.buffer.is_empty() {
-                Some(Err(format!(
-                    "no data received within {} ms",
-                    slot.timeout_ms
-                )))
-            } else {
-                Some(Ok(std::mem::take(&mut slot.buffer)))
-            }
-        } else {
-            None
+        if !expired {
+            return;
         }
+        let slot = guard.take().unwrap();
+        let result = if slot.buffer.is_empty() {
+            Err(format!("no data received within {} ms", slot.timeout_ms))
+        } else {
+            Ok(slot.buffer)
+        };
+        Some((slot.done, result))
     };
-    if let Some(result) = early {
-        finish_read_slot(shared, result);
+    if let Some((done, result)) = completed {
+        wake_done(&done, result);
     }
 }
 
+pub(crate) fn wake_done(done: &ReadDone, result: Result<Vec<u8>, String>) {
+    let (lock, cvar) = &**done;
+    *crate::sync_util::lock_or_recover(lock) = Some(result);
+    cvar.notify_all();
+}
+
 pub(crate) fn finish_read_slot(shared: &RxHubShared, result: Result<Vec<u8>, String>) {
-    // Deadlock fix: bind the taken slot in a `let` (not an `if let` scrutinee)
-    // so the `read_slot` MutexGuard is dropped here, before locking `slot.done`
-    // below — Rust's temporary-lifetime extension for `if let` scrutinees would
-    // otherwise keep it held for the whole match arm, taking `read_slot` then
-    // `done` while read_request() can take them in the opposite order.
+    // Take slot first so the read_slot guard drops before locking done (ABBA).
     let slot = crate::sync_util::lock_or_recover(&shared.read_slot).take();
     if let Some(slot) = slot {
-        let (lock, cvar) = &*slot.done;
-        *crate::sync_util::lock_or_recover(lock) = Some(result);
-        cvar.notify_all();
+        wake_done(&slot.done, result);
     }
 }
 
@@ -732,13 +762,9 @@ pub(crate) fn push_idle(shared: &RxHubShared, chunk: &[u8]) {
 }
 
 pub(crate) fn finish_drain(shared: &RxHubShared, result: Result<Vec<u8>, String>) {
-    // Same fix as finish_read_slot(): `let` first so the `drain` guard drops
-    // before locking `drain.done`.
     let drain = crate::sync_util::lock_or_recover(&shared.drain).take();
     if let Some(drain) = drain {
-        let (lock, cvar) = &*drain.done;
-        *crate::sync_util::lock_or_recover(lock) = Some(result);
-        cvar.notify_all();
+        wake_done(&drain.done, result);
     }
 }
 
@@ -976,8 +1002,7 @@ mod tests {
 
     #[test]
     fn recover_or_timeout_returns_result_posted_during_recovery_window() {
-        let done: Arc<(Mutex<Option<Result<Vec<u8>, String>>>, Condvar)> =
-            Arc::new((Mutex::new(None), Condvar::new()));
+        let done: ReadDone = Arc::new((Mutex::new(None), Condvar::new()));
         let done_bg = done.clone();
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(10));
@@ -993,12 +1018,10 @@ mod tests {
     #[test]
     fn recover_or_timeout_survives_spurious_wakeups() {
         // Fires several notify_all()s with `done` still None before the
-        // real result lands — simulates the condvar spurious-wakeup case
-        // review finding #3 flagged. A single-`wait_timeout` version (the
-        // pre-fix code) returns a false timeout on the very first one;
-        // the fixed loop keeps waiting out the recovery window instead.
-        let done: Arc<(Mutex<Option<Result<Vec<u8>, String>>>, Condvar)> =
-            Arc::new((Mutex::new(None), Condvar::new()));
+        // real result lands — simulates the condvar spurious-wakeup case.
+        // A single-`wait_timeout` version returns a false timeout on the
+        // first one; the fixed loop keeps waiting out the recovery window.
+        let done: ReadDone = Arc::new((Mutex::new(None), Condvar::new()));
         let done_bg = done.clone();
         thread::spawn(move || {
             for _ in 0..3 {
@@ -1017,13 +1040,158 @@ mod tests {
 
     #[test]
     fn recover_or_timeout_falls_back_to_timeout_error_when_nothing_arrives() {
-        let done: (Mutex<Option<Result<Vec<u8>, String>>>, Condvar) =
-            (Mutex::new(None), Condvar::new());
+        let done: ReadDone = Arc::new((Mutex::new(None), Condvar::new()));
         let start = Instant::now();
         let result = RxHubShared::recover_or_timeout(&done.0, &done.1, 5);
         let err = result.expect_err("no result ever posted");
         assert!(err.contains("no data received"), "unexpected: {err}");
         // Bounded by READ_SLOT_RACE_RECOVERY_WINDOW (50ms), not a hang.
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    // --- Post-#38: completing a slot takes it whole (no emptied-Some window) ---
+
+    fn mock_done() -> ReadDone {
+        Arc::new((Mutex::new(None), Condvar::new()))
+    }
+
+    #[test]
+    fn route_read_slot_chunk_completing_removes_slot_before_post() {
+        let shared = RxHubShared::new();
+        let done = mock_done();
+        *crate::sync_util::lock_or_recover(&shared.read_slot) = Some(ReadSlot {
+            max_bytes: 3,
+            fill: false,
+            timeout_ms: 100,
+            buffer: Vec::new(),
+            deadline: Instant::now() + Duration::from_secs(5),
+            done: done.clone(),
+        });
+        route_read_slot_chunk(&shared, b"xyz");
+        assert!(crate::sync_util::lock_or_recover(&shared.read_slot).is_none());
+        let guard = crate::sync_util::lock_or_recover(&done.0);
+        assert_eq!(guard.as_ref().unwrap().as_ref().unwrap(), b"xyz");
+    }
+
+    #[test]
+    fn tick_read_slot_deadline_takes_whole_slot() {
+        let shared = RxHubShared::new();
+        let done = mock_done();
+        *crate::sync_util::lock_or_recover(&shared.read_slot) = Some(ReadSlot {
+            max_bytes: 64,
+            fill: false,
+            timeout_ms: 50,
+            buffer: b"late".to_vec(),
+            deadline: Instant::now() - Duration::from_millis(1),
+            done: done.clone(),
+        });
+        tick_read_slot(&shared);
+        assert!(crate::sync_util::lock_or_recover(&shared.read_slot).is_none());
+        let guard = crate::sync_util::lock_or_recover(&done.0);
+        assert_eq!(guard.as_ref().unwrap().as_ref().unwrap(), b"late");
+    }
+
+    #[test]
+    fn tick_drain_complete_takes_whole_slot() {
+        let shared = RxHubShared::new();
+        let done: DrainDone = Arc::new((Mutex::new(None), Condvar::new()));
+        *crate::sync_util::lock_or_recover(&shared.drain) = Some(DrainSlot {
+            idle_ms: 1,
+            cancel: Arc::new(AtomicBool::new(false)),
+            buffer: b"buf".to_vec(),
+            last_byte_at: Some(Instant::now() - Duration::from_millis(50)),
+            started_at: Instant::now() - Duration::from_millis(100),
+            deadline: Instant::now() + Duration::from_secs(5),
+            solicited_prefixes: vec![],
+            done: done.clone(),
+        });
+        let mut routing = HubRoutingState::new("p".into());
+        shared.tick("p", &mut routing);
+        assert!(crate::sync_util::lock_or_recover(&shared.drain).is_none());
+        let guard = crate::sync_util::lock_or_recover(&done.0);
+        assert_eq!(guard.as_ref().unwrap().as_ref().unwrap(), b"buf");
+    }
+
+    fn wait_until_drain_slot(shared: &RxHubShared) {
+        let start = Instant::now();
+        while crate::sync_util::lock_or_recover(&shared.drain).is_none() {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "drain worker never installed slot"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn route_drain_chunk_returns_false_when_no_slot() {
+        let shared = RxHubShared::new();
+        assert!(!route_drain_chunk(&shared, "p", b"x"));
+    }
+
+    #[test]
+    fn feed_bytes_without_drain_goes_to_idle() {
+        let shared = RxHubShared::new();
+        shared.feed_bytes(b"saved", &mut HubRoutingState::new("p".into()));
+        assert_eq!(
+            &crate::sync_util::lock_or_recover(&shared.idle)[..],
+            b"saved"
+        );
+    }
+
+    #[test]
+    fn drain_timeout_recovers_result_already_posted_to_done() {
+        // finish_drain posts before the wait loop's hard deadline; reclaim
+        // must return that Ok rather than a synthetic timeout.
+        let shared = Arc::new(RxHubShared::new());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let shared_bg = shared.clone();
+        let handle = thread::spawn(move || shared_bg.drain(10_000, 0, cancel, vec![]));
+        wait_until_drain_slot(&shared);
+        finish_drain(&shared, Ok(b"drained".to_vec()));
+        assert_eq!(handle.join().unwrap().expect("recovered"), b"drained");
+    }
+
+    #[test]
+    fn drain_timeout_reclaim_returns_buffer_left_in_slot() {
+        // max_ms=0 → wait loop hard deadline is ~500ms; inject bytes into the
+        // live slot without completing via tick so reclaim's take() path runs.
+        let shared = Arc::new(RxHubShared::new());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let shared_bg = shared.clone();
+        let handle = thread::spawn(move || shared_bg.drain(10_000, 0, cancel, vec![]));
+        wait_until_drain_slot(&shared);
+        {
+            let mut guard = crate::sync_util::lock_or_recover(&shared.drain);
+            let slot = guard.as_mut().expect("drain slot still live");
+            slot.buffer.extend_from_slice(b"kept");
+            slot.last_byte_at = Some(Instant::now());
+        }
+        assert_eq!(handle.join().unwrap().expect("slot buffer"), b"kept");
+    }
+
+    #[test]
+    fn drain_timeout_reclaim_empty_slot_is_timeout_error() {
+        let shared = Arc::new(RxHubShared::new());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let err = shared
+            .drain(10_000, 0, cancel, vec![])
+            .expect_err("empty reclaim");
+        assert!(err.contains("drain timed out"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn drain_timeout_preserves_finish_drain_error() {
+        let shared = Arc::new(RxHubShared::new());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let shared_bg = shared.clone();
+        let handle = thread::spawn(move || shared_bg.drain(10_000, 0, cancel, vec![]));
+        wait_until_drain_slot(&shared);
+        finish_drain(&shared, Err("drain read failed: boom".into()));
+        let err = handle.join().unwrap().expect_err("posted Err");
+        assert!(
+            err.contains("drain read failed"),
+            "must not rewrite to generic timeout, got: {err}"
+        );
     }
 }
