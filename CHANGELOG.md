@@ -3,6 +3,12 @@
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
 
+## [3.0.4](https://github.com/s00d/tauri-plugin-serialplugin/compare/v3.0.3...v3.0.4) (2026-09-05)
+
+### Bug Fixes
+
+* **hub:** take the whole read/drain slot on complete (no emptied-`Some` race with timeout reclaim); drain timeout reclaim mirrors read and preserves posted errors; do not drop RX when the drain slot is reclaimed mid-read ([#39](https://github.com/s00d/tauri-plugin-serialplugin/issues/39))
+
 ## [3.0.3](https://github.com/s00d/tauri-plugin-serialplugin/compare/v3.0.2...v3.0.3) (2026-09-05)
 
 ### Bug Fixes
