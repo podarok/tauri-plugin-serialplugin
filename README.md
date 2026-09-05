@@ -453,7 +453,7 @@ use tauri::{AppHandle, State};
 #[tauri::command]
 async fn configure_production_logging(
     app: AppHandle<tauri::Wry>,
-    serial: State<'_, tauri_plugin_serialplugin::api::desktop::SerialPort<tauri::Wry>>
+    serial: State<'_, tauri_plugin_serialplugin::api::SerialPort<tauri::Wry>>
 ) -> Result<(), String> {
     // Only show errors in production
     set_log_level(app, serial, LogLevel::Error)
@@ -530,7 +530,7 @@ use std::collections::HashMap;
 #[tauri::command]
 async fn rust_serial_example(
     app: AppHandle<tauri::Wry>,
-    serial: State<'_, tauri_plugin_serialplugin::api::desktop::SerialPort<tauri::Wry>>
+    serial: State<'_, tauri_plugin_serialplugin::api::SerialPort<tauri::Wry>>
 ) -> Result<(), String> {
     // Get available ports
     let ports = available_ports(app.clone(), serial.clone())
@@ -646,7 +646,7 @@ use std::collections::HashMap;
 #[tauri::command]
 async fn advanced_serial_example(
     app: AppHandle<tauri::Wry>,
-    serial: State<'_, tauri_plugin_serialplugin::api::desktop::SerialPort<tauri::Wry>>
+    serial: State<'_, tauri_plugin_serialplugin::api::SerialPort<tauri::Wry>>
 ) -> Result<(), String> {
     // Get available ports with error handling
     let ports = match available_ports(app.clone(), serial.clone()) {
@@ -752,7 +752,7 @@ use tauri::{AppHandle, State};
 #[tauri::command]
 async fn binary_data_example(
     app: AppHandle<tauri::Wry>,
-    serial: State<'_, tauri_plugin_serialplugin::api::desktop::SerialPort<tauri::Wry>>
+    serial: State<'_, tauri_plugin_serialplugin::api::SerialPort<tauri::Wry>>
 ) -> Result<(), String> {
     let port_path = "COM1".to_string();
     
@@ -809,7 +809,7 @@ use tauri::{AppHandle, State};
 #[tauri::command]
 async fn my_serial_function(
     app: AppHandle<tauri::Wry>,
-    serial: State<'_, tauri_plugin_serialplugin::api::desktop::SerialPort<tauri::Wry>>
+    serial: State<'_, tauri_plugin_serialplugin::api::SerialPort<tauri::Wry>>
 ) -> Result<(), String> {
     // Use command functions
     let ports = available_ports(app.clone(), serial.clone())?;
@@ -824,7 +824,7 @@ Use the SerialPort methods directly:
 
 ```rust
 use tauri::State;
-use tauri_plugin_serialplugin::api::desktop::SerialPort;
+use tauri_plugin_serialplugin::api::SerialPort;
 
 #[tauri::command]
 async fn my_serial_function(
