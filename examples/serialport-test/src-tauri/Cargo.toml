@@ -13,10 +13,11 @@ name = "tauri_app_lib"
 crate-type = ["staticlib", "cdylib", "lib"]
 
 [build-dependencies]
-tauri-build = { version = "2.1.1", features = [] }
+# Keep major.minor aligned with @tauri-apps/api (Tauri CLI rejects mismatches).
+tauri-build = { version = "~2.6", features = [] }
 
 [dependencies]
-tauri = { version = "2.5.1", features = [] }
+tauri = { version = "~2.6", features = [] }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "^1.0.135"
 serialport = "4.7.0"
