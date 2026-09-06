@@ -12,3 +12,5 @@ test-results
 *.aab
 local.properties
 .publish.md
+# usb-driver-tester lock is disposable; serialport-test lock is tracked for Android CI.
+examples/usb-driver-tester/**/Cargo.lock

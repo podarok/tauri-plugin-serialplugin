@@ -1,5 +1,17 @@
 # Changelog
 
+
+## [3.0.5](https://github.com/s00d/tauri-plugin-serialplugin/compare/v3.0.0...v3.0.5) (2026-09-06)
+
+### Bug Fixes
+
+* ABBA deadlock between RxHubShared read/drain slot and its done mutex ([#38](https://github.com/s00d/tauri-plugin-serialplugin/issues/38)) ([e252491](https://github.com/s00d/tauri-plugin-serialplugin/commit/e2524915ed7c628ea87443c210aaeba316bf0bc1)), closes [#2](https://github.com/s00d/tauri-plugin-serialplugin/issues/2)
+* **cdc-acm:** expose serial state notifications ([#37](https://github.com/s00d/tauri-plugin-serialplugin/issues/37)) ([0f5a944](https://github.com/s00d/tauri-plugin-serialplugin/commit/0f5a94483d781849c9170498233636a9f21d761c))
+* **cdc-acm:** skip bad serial-state frames ([4a47cd6](https://github.com/s00d/tauri-plugin-serialplugin/commit/4a47cd607c48fd98b29b6c3a79c14c1eaf171fb5))
+* **clippy:** drop redundant borrow in format! arg ([f15973f](https://github.com/s00d/tauri-plugin-serialplugin/commit/f15973f1c123f9288492da04a8e745dfd9174ccd))
+* **hub:** take whole read/drain slot on complete ([#39](https://github.com/s00d/tauri-plugin-serialplugin/issues/39)) ([8851d6b](https://github.com/s00d/tauri-plugin-serialplugin/commit/8851d6b5edf83cf58878858f13852f84e7b0450a))
+* **npm:** ship guest-js in published package ([0f1e3ff](https://github.com/s00d/tauri-plugin-serialplugin/commit/0f1e3ff254f672959b0e68b2a8c46401460f1aef)), closes [#36](https://github.com/s00d/tauri-plugin-serialplugin/issues/36)
+
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
 

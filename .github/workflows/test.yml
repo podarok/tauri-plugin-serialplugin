@@ -198,10 +198,49 @@ jobs:
 
   windows:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
     - uses: actions/checkout@v4
+
+    - name: Use Node.js 20.x
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20.x
+
+    - name: Install pnpm
+      uses: pnpm/action-setup@v2
+      with:
+        version: 9.15.4
+
+    - name: Get pnpm store directory
+      shell: bash
+      run: |
+        echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
+
+    - name: Setup pnpm cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ env.STORE_PATH }}
+        key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+        restore-keys: |
+          ${{ runner.os }}-pnpm-store-
+
+    # Do not cache node_modules on Windows: restored pnpm symlinks/junctions often
+    # break with EPERM in Node realpath (Jest fails before any test runs).
+
+    - name: Cache Rust dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          ~/.cargo/bin
+          target
+          examples/*/target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
@@ -217,16 +256,26 @@ jobs:
     - name: Cargo check Windows
       run: cargo check --target x86_64-pc-windows-msvc
 
-    - name: Install pnpm
-      uses: pnpm/action-setup@v2
-      with:
-        version: 9.15.4
-
     - name: Install dependencies
-      run: pnpm install
+      run: pnpm install --frozen-lockfile
 
     - name: TypeScript check
       run: pnpm check
 
+    # Plugin lib test exe hits 0xc0000139 (STATUS_ENTRYPOINT_NOT_FOUND) on GHA Windows.
+    # Hub/PTY coverage stays on Ubuntu/macOS nextest; still run the rest of the workspace.
+    - name: Run Rust tests (workspace except plugin lib exe)
+      run: cargo test --workspace --exclude tauri-plugin-serialplugin
+
     - name: Run JavaScript tests
       run: pnpm test
+
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results-windows
+        path: |
+          coverage/
+          test-results/
+        if-no-files-found: warn

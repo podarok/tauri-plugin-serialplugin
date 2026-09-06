@@ -68,6 +68,9 @@ class UsbFdBridge private constructor(
 
     @Volatile private var shutDown = false
 
+    /** Permission wait budget; short in testMode so denied/timeout tests stay fast. */
+    @Volatile private var permissionWaitMs: Long = if (testMode) 200L else 30_000L
+
     private val ioExecutor: Executor = if (testMode) {
         Executor { it.run() }
     } else {
@@ -76,6 +79,7 @@ class UsbFdBridge private constructor(
     private val usbManager = context?.getSystemService(Context.USB_SERVICE) as? UsbManager
     private val connections = ConcurrentHashMap<String, UsbDeviceConnection>()
     private val permissionFutures = ConcurrentHashMap<String, CompletableFuture<Boolean>>()
+    private val permissionLock = Any()
 
     private val usbReceiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context, intent: Intent) {
@@ -128,7 +132,29 @@ class UsbFdBridge private constructor(
         permissionFutures[deviceName]?.complete(granted)
     }
 
+    /**
+     * Test-only: stretch [requestPermission] wait so shutdown can be asserted to
+     * unblock before the timeout (default test wait is 200ms).
+     */
+    fun setPermissionWaitMsForTest(ms: Long) {
+        check(testMode)
+        permissionWaitMs = ms
+    }
+
+    /** Fail any in-flight permission waits so blocked IO threads can exit. */
+    private fun failPendingPermissionsLocked() {
+        permissionFutures.keys.toList().forEach { name ->
+            permissionFutures.remove(name)?.complete(false)
+        }
+    }
+
     fun shutdown() {
+        // Flip + drain under the same lock as future registration so a waiter
+        // cannot insert after failPendingPermissions and then block for 30s.
+        synchronized(permissionLock) {
+            shutDown = true
+            failPendingPermissionsLocked()
+        }
         if (testMode) {
             connections.keys.toList().forEach { closeDeviceFd(it) }
             if (registerReceiver && context != null) {
@@ -139,7 +165,6 @@ class UsbFdBridge private constructor(
             }
             return
         }
-        shutDown = true
         val pool = ioExecutor as ExecutorService
         val ctx = context
         val shouldUnregister = registerReceiver
@@ -199,6 +224,7 @@ class UsbFdBridge private constructor(
     }
 
     fun openDeviceFd(deviceName: String): Int {
+        if (shutDown) throw IOException("USB fd bridge shut down")
         connections[deviceName]?.let {
             Log.i(TAG, "openDeviceFd reuse $deviceName fd=${it.fileDescriptor}")
             return it.fileDescriptor
@@ -207,6 +233,7 @@ class UsbFdBridge private constructor(
         val device = mgr.deviceList.values.find { it.deviceName == deviceName }
             ?: throw IOException("device not found: $deviceName")
         if (!mgr.hasPermission(device)) requestPermission(device)
+        if (shutDown) throw IOException("USB fd bridge shut down")
         // Do NOT claimInterface here — Rust nusb detach_and_claim owns claiming.
         // Pre-claim makes the same fd report "io interface is busy" on open.
         val conn = mgr.openDevice(device) ?: throw IOException("open failed: $deviceName")
@@ -262,7 +289,10 @@ class UsbFdBridge private constructor(
         val ctx = context ?: throw IOException("no context")
         val name = device.deviceName
         val fut = CompletableFuture<Boolean>()
-        permissionFutures[name] = fut
+        synchronized(permissionLock) {
+            if (shutDown) throw IOException("USB fd bridge shut down")
+            permissionFutures[name] = fut
+        }
         val intent = Intent(ACTION_USB_PERMISSION).apply {
             setPackage(ctx.packageName)
         }
@@ -273,15 +303,16 @@ class UsbFdBridge private constructor(
         }
         val pi = PendingIntent.getBroadcast(ctx, 0, intent, flags)
         mgr.requestPermission(device, pi)
+        // Wait budget: short in normal tests; production / stretched tests use 30s.
+        // shutdown()'s failPendingPermissions completes the future early.
         val granted = try {
-            if (testMode) {
-                fut.get(200, TimeUnit.MILLISECONDS)
-            } else {
-                fut.get(30, TimeUnit.SECONDS)
-            }
+            fut.get(permissionWaitMs, TimeUnit.MILLISECONDS)
         } catch (_: TimeoutException) {
             false
+        } finally {
+            permissionFutures.remove(name, fut)
         }
+        if (shutDown) throw IOException("USB fd bridge shut down")
         if (!granted) {
             throw IOException("USB permission denied for $name")
         }

@@ -361,7 +361,7 @@ impl<R: Runtime> SerialPort<R> {
         Ok(port_list)
     }
 
-    /// Cancel an in-flight poll [`read`] (does not stop an active [`watch`]).
+    /// Cancel an in-flight poll [`Self::read`] (does not stop an active [`Self::watch`]).
     pub fn cancel_read(&self, path: String) -> Result<(), Error> {
         let cp = self.resolve_connected_port(&path)?;
         if let Ok(guard) = cp.rx_hub.lock() {

@@ -9,6 +9,10 @@ pub trait ExchangeIo {
 }
 
 /// Physical port write / purge (alias for unified backend trait surface).
+///
+/// Prefer [`ExchangeIo`]. Kept public for patch-compat with downstream imports;
+/// will be removed in the next major.
+#[deprecated(note = "use ExchangeIo; PortBackend will be removed in 4.0")]
 pub trait PortBackend: ExchangeIo {
     fn write_physical(&self, path: &str, data: &[u8]) -> Result<(), Error>;
     fn purge_rx(&self, path: &str) -> Result<(), Error>;
