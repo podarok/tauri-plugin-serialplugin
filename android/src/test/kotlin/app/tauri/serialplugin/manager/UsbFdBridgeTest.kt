@@ -249,4 +249,86 @@ class UsbFdBridgeTest {
         assertEquals(55, harness.bridge.openDeviceFd(DEVICE))
         verify(harness.usbManager, times(1)).openDevice(device)
     }
+
+    @Test
+    fun openDeviceFd_doubleGrantWhileWaiting() {
+        val harness = usbHarness()
+        val device = mockDevice()
+        stubDeviceList(harness.usbManager, device)
+        whenever(harness.usbManager.hasPermission(device)).thenReturn(false)
+        val conn = mockConn(77)
+        whenever(harness.usbManager.openDevice(device)).thenReturn(conn)
+        doAnswer {
+            harness.bridge.completePermissionForTest(DEVICE, true)
+            harness.bridge.completePermissionForTest(DEVICE, true)
+            null
+        }.whenever(harness.usbManager).requestPermission(eq(device), any())
+
+        assertEquals(77, harness.bridge.openDeviceFd(DEVICE))
+    }
+
+    @Test
+    fun openDeviceFd_afterDeny_retrySucceeds() {
+        val harness = usbHarness()
+        val device = mockDevice()
+        stubDeviceList(harness.usbManager, device)
+        whenever(harness.usbManager.hasPermission(device)).thenReturn(false)
+        val conn = mockConn(88)
+        whenever(harness.usbManager.openDevice(device)).thenReturn(conn)
+
+        var grant = false
+        doAnswer {
+            harness.bridge.completePermissionForTest(DEVICE, grant)
+            null
+        }.whenever(harness.usbManager).requestPermission(eq(device), any())
+
+        val denied = assertThrows(IOException::class.java) {
+            harness.bridge.openDeviceFd(DEVICE)
+        }
+        assertTrue(denied.message!!.contains("permission denied"))
+
+        grant = true
+        assertEquals(88, harness.bridge.openDeviceFd(DEVICE))
+    }
+
+    @Test
+    fun openDeviceFd_shutdownDuringPermissionWait() {
+        val harness = usbHarness()
+        harness.bridge.setPermissionWaitMsForTest(30_000)
+        val device = mockDevice()
+        stubDeviceList(harness.usbManager, device)
+        whenever(harness.usbManager.hasPermission(device)).thenReturn(false)
+
+        val err = java.util.concurrent.atomic.AtomicReference<Throwable>()
+        val started = java.util.concurrent.CountDownLatch(1)
+        doAnswer {
+            started.countDown()
+            null
+        }.whenever(harness.usbManager).requestPermission(eq(device), any())
+
+        val t = Thread {
+            try {
+                harness.bridge.openDeviceFd(DEVICE)
+            } catch (e: Throwable) {
+                err.set(e)
+            }
+        }
+        t.start()
+        assertTrue(started.await(2, java.util.concurrent.TimeUnit.SECONDS))
+        val t0 = System.nanoTime()
+        harness.bridge.shutdown()
+        t.join(3000)
+        val elapsedMs = (System.nanoTime() - t0) / 1_000_000
+        assertTrue("worker should finish from shutdown alone", !t.isAlive)
+        assertTrue(
+            "shutdown should unblock well under the 30s permission wait (took ${elapsedMs}ms)",
+            elapsedMs < 2000,
+        )
+        assertTrue(err.get() is IOException)
+        val msg = err.get()!!.message!!
+        assertTrue(
+            "expected shutdown or permission denial, got: $msg",
+            msg.contains("permission denied") || msg.contains("shut down"),
+        )
+    }
 }

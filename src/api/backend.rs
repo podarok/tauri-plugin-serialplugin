@@ -5,6 +5,7 @@ use crate::error::Error;
 use crate::port::tx_queue::PortTxQueue;
 use std::sync::Mutex;
 
+#[allow(deprecated)]
 pub use crate::exchange::io::{ExchangeIo, PortBackend};
 
 /// Configure AT session on physical or virtual path.

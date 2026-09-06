@@ -67,7 +67,7 @@ Legacy Tauri events (`plugin-serialplugin-read-*`) and Android plugin triggers (
 | Option | Desktop | Android |
 |--------|---------|---------|
 | `timeout` | Batch coalescing window (ms) | Coalescing / flush hint where supported |
-| `serialDataFlushIntervalMs` | Preferred batch interval; falls back to `timeout` | `BufferedEmitter` flush (10–2000 ms) |
+| `serialDataFlushIntervalMs` | Preferred batch interval for hub `batch_timeout_ms` (falls back to `timeout`) | Same; clamped typically 10–2000 ms |
 | `size` | Read chunk size per syscall | Reserved |
 | `decode` | JS-only: `TextDecoder` on `onData` | JS-only |
 
@@ -92,11 +92,10 @@ Legacy Tauri events (`plugin-serialplugin-read-*`) and Android plugin triggers (
    7.8. [Auto-Reconnect](#auto-reconnect-management)
 8. [Common Use Cases](#common-use-cases)
 9. [Android Setup](#android-setup)
-10. [Contributing](#contributing)
-11. [Development Setup](#development-setup)
-12. [Testing](#testing)
-13. [Partners](#partners)
-14. [License](#license)
+10. [Development Setup](#development-setup)
+11. [Testing](#testing)
+12. [Partners](#partners)
+13. [License](#license)
 
 ---
 
@@ -104,7 +103,7 @@ Legacy Tauri events (`plugin-serialplugin-read-*`) and Android plugin triggers (
 
 ### Prerequisites
 
-- **Rust** version 1.70 or higher
+- **Rust** version 1.79 or higher (MSRV)
 - **Tauri** 2.0 or higher
 - **Node.js** and an npm-compatible package manager (npm, yarn, pnpm)
 
@@ -876,7 +875,17 @@ use tauri_plugin_serialplugin::commands::{
     capabilities,              // Runtime info
     watch,                     // Stream events via Channel
     unwatch,                   // Stop watch session
-    cancel_read,               // Cancel poll read or active watch (shared stop channel)
+    cancel_read,               // Cancel in-flight poll read only (does not detach watch)
+    exchange,                  // Write + read-until
+    exchange_binary,           // Binary exchange
+    cancel_exchange,           // Cancel in-flight exchange / AT job
+    at,                        // Native AT queue command
+    at_phases,                 // Multi-phase AT job
+    send_sms_pdu,              // CMGS PDU helper
+    configure_at_session,      // AT session defaults
+    enable_mux,                // Enter CMUX
+    open_mux_channel,          // Open virtual CMUX channel
+    disable_mux,               // Tear down CMUX
     
     // Port configuration
     set_baud_rate,             // Set baud rate
@@ -930,7 +939,7 @@ pub fn open<R: Runtime>(
     parity: Option<Parity>,
     stop_bits: Option<StopBits>,
     timeout: Option<u64>,
-) -> Result<(), Error>
+) -> Result<String, Error>  // canonical path (Android session key / desktop echo)
 
 // Write data
 pub fn write<R: Runtime>(
@@ -1157,13 +1166,13 @@ class SerialPort {
 class SerialPort {
   /**
    * Opens the serial port with specified configuration
-   * @returns {Promise<void>}
+   * @returns {Promise<string>} Canonical path (Android re-keys to session path; desktop echoes input)
    * @throws {Error} If port is already open or invalid configuration
    * @example
    * const port = new SerialPort({ path: "COM1", baudRate: 9600 });
-   * await port.open();
+   * const canonical = await port.open();
    */
-  async open(): Promise<void>;
+  async open(): Promise<string>;
 
   /**
    * Closes the serial port connection
@@ -1693,12 +1702,6 @@ See [`android/README.md`](android/README.md) and [`android/BUILD_INSTRUCTIONS.md
 
 ---
 
-## Contributing
-
-Pull requests are welcome! Please read our contributing guidelines before you start.
-
----
-
 ## Development Setup
 
 ```bash
@@ -1749,6 +1752,18 @@ Use `watch()`, `exchange()`, and `sendAt()` against that path; unplugging the pe
 
 ---
 
+## Contributing
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for build, test, and PR guidelines.
+
+## Publishing
+
+See [PUBLISHING.md](./PUBLISHING.md) (`pnpm release:patch|minor|major` → `pnpm login` if needed → `pnpm release:publish`).
+
+## Security
+
+See [SECURITY.md](./SECURITY.md) to report vulnerabilities privately.
+
 ## Partners
 
 If you find this plugin valuable and would like to support further development, feel free to donate via [DonationAlerts](https://www.donationalerts.com/r/s00d88). Any contribution is greatly appreciated!
@@ -1757,4 +1772,4 @@ If you find this plugin valuable and would like to support further development, 
 
 ## License
 
-This code is dual-licensed under MIT or Apache-2.0, where applicable, © 2019–2025 Tauri Programme within The Commons Conservancy.
+Dual-licensed under MIT or Apache-2.0. See [LICENSE-MIT](./LICENSE-MIT) and [LICENSE-APACHE](./LICENSE-APACHE).

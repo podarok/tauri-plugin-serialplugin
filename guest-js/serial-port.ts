@@ -53,13 +53,18 @@ function textDecoder(encoding: string): TextDecoder {
   }
 }
 
+/** Normalize invoke payloads that arrive as `number[]` into `Uint8Array`. */
+function toUint8Raw(data: Uint8Array | number[] | ArrayLike<number>): Uint8Array {
+  return data instanceof Uint8Array ? data : new Uint8Array(data);
+}
+
 function dispatchWatchData(
   data: number[],
   decoder: TextDecoder,
   decode: boolean,
   onData: (data: string | Uint8Array) => void,
 ): void {
-  const bytes = new Uint8Array(data);
+  const bytes = toUint8Raw(data);
   if (!decode) {
     onData(bytes);
     return;
@@ -509,7 +514,7 @@ export class SerialPort {
     }
   }
 
-  async open(): Promise<void> {
+  async open(): Promise<string> {
     if (!this.options.path) {
       throw new Error('path cannot be empty');
     }
@@ -517,7 +522,7 @@ export class SerialPort {
       throw new Error('baudRate cannot be empty');
     }
     if (this.isOpen) {
-      return;
+      return this.options.path;
     }
     if (this.isProcessingOpenClose) {
       throw new Error('Serial port open/close already in progress');
@@ -540,6 +545,7 @@ export class SerialPort {
       if (this.atSessionOptions) {
         await this.configureAtSession(this.atSessionOptions);
       }
+      return this.options.path;
     } finally {
       this.isProcessingOpenClose = false;
     }
@@ -565,7 +571,7 @@ export class SerialPort {
       timeout: options?.timeout ?? this.options.timeout,
       size: options?.size ?? this.size,
     });
-    return new Uint8Array(result);
+    return toUint8Raw(result);
   }
 
   async setBaudRate(value: number | BaudRate): Promise<void> {
@@ -685,7 +691,7 @@ export class SerialPort {
     });
     return {
       ...result,
-      raw: new Uint8Array(result.raw as unknown as number[]),
+      raw: toUint8Raw(result.raw as unknown as number[]),
     };
   }
 
@@ -701,7 +707,7 @@ export class SerialPort {
     });
     return {
       ...result,
-      raw: new Uint8Array(result.raw as unknown as number[]),
+      raw: toUint8Raw(result.raw as unknown as number[]),
     };
   }
 
@@ -789,7 +795,7 @@ export class SerialPort {
     });
     return {
       ...result,
-      raw: new Uint8Array(result.raw as unknown as number[]),
+      raw: toUint8Raw(result.raw as unknown as number[]),
     };
   }
 
@@ -804,7 +810,7 @@ export class SerialPort {
     });
     return results.map((r) => ({
       ...r,
-      raw: new Uint8Array(r.raw as unknown as number[]),
+      raw: toUint8Raw(r.raw as unknown as number[]),
     }));
   }
 
@@ -825,7 +831,7 @@ export class SerialPort {
     });
     return results.map((r) => ({
       ...r,
-      raw: new Uint8Array(r.raw as unknown as number[]),
+      raw: toUint8Raw(r.raw as unknown as number[]),
     }));
   }
 
