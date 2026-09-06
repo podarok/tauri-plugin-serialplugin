@@ -258,7 +258,7 @@ impl RxHubShared {
         *crate::sync_util::lock_or_recover(&self.exchange_waiter) = None;
     }
 
-    /// Wake an in-flight exchange waiter when [`cancel_exchange`] is invoked.
+    /// Wake an in-flight exchange waiter when [`crate::api::serial::SerialPort::cancel_exchange`] is invoked.
     pub fn cancel_active_exchange(&self) {
         if let Some(waiter) = crate::sync_util::lock_or_recover(&self.exchange_waiter).as_ref() {
             waiter.fail_with_reason("exchange cancelled".into());

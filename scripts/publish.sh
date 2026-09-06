@@ -48,9 +48,13 @@ echo "==> js deps + publish surface"
 pnpm install --frozen-lockfile
 bash "$ROOT/scripts/check-publish-surface.sh"
 
+# Do not pass --no-git-checks: pnpm forwards it to `npm publish` of the
+# packed tarball, and npm >=12 rejects unknown --git-checks (EUNKNOWNCONFIG).
+# Branch policy lives in .npmrc (publish-branch=main).
+
 if [[ "$DRY" -eq 1 ]]; then
   echo "==> pnpm publish --dry-run"
-  pnpm publish --dry-run --no-git-checks
+  pnpm publish --dry-run
   echo "==> cargo publish --dry-run"
   cargo publish --dry-run --allow-dirty
   echo "DRY-RUN OK ($CARGO_VER)"
@@ -60,7 +64,7 @@ fi
 # JS registry first: sessions expire often; fail before crates.io.
 echo "==> pnpm publish ($NPM_VER)"
 pnpm build
-pnpm publish --no-git-checks
+pnpm publish
 
 echo "==> cargo publish ($CARGO_VER)"
 echo "note: path dep android-usb-serial must already be on crates.io at the required version"
